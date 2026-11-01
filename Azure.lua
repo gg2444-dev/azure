@@ -529,7 +529,7 @@ function Page:Section(title, col)
 		Position = UDim2.new(0, 0, 0, originY),
 		Size = UDim2.new(1, 0, 0, 34),
 		BackgroundTransparency = 1,
-		Parent = column,
+		Parent = column.frame,
 	})
 	MakeLabel({
 		Text = string.upper(title),
@@ -965,8 +965,8 @@ function Hub:Page(name, dual)
 			BackgroundTransparency = 1,
 			Parent = scroll,
 		})
-		col.cursor = 0
-		page.cols[i] = col
+		-- plain wrapper table: Roblox Instances reject custom fields like .cursor
+		page.cols[i] = { frame = col, cursor = 0 }
 	end
 	Pages[name] = page
 	return page
