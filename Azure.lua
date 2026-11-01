@@ -137,7 +137,7 @@ local function readConfigFile()
 	return nil
 end
 
-local Hub = { Version = "1.1.0" }
+local Hub = { Version = "1.2.0" }
 Hub.Changed = Signal.new()
 
 function Hub:Get(id) return State[id] end
@@ -1091,6 +1091,8 @@ do
 	l:Info("Player: " .. LocalPlayer.Name)
 end
 
+local Diagnose -- assigned by the gameplay engine below; Report button calls it
+
 -- SHOOTING
 do
 	local p = Hub:Page("SHOOTING", true)
@@ -1104,7 +1106,10 @@ do
 	l:Slider("Release Delay (ms)", "shoot.delay", 0, 300, 0)
 	l:Dropdown("Release Input", "shoot.device",
 		{ "Auto", "Keyboard (E)", "Controller (Square)" }, "Auto")
-	l:Info("Auto Green watches the shot meter and releases inside the green zone. It works on keyboard and on a PS5/Xbox controller. If it never fires, enable the Meter in the game's settings.")
+	l:Button("Debug", "Report", function()
+		if Diagnose then Diagnose() end
+	end)
+	l:Info("Auto Green watches the shot meter and releases inside the green zone. It works on keyboard and on a PS5/Xbox controller. If it never fires, press REPORT (Debug) and send me the console line.")
 	l:Info("Auto Shoot needs game internals - not active yet.")
 end
 
@@ -1401,18 +1406,45 @@ local function getHumanoid()
 	return ok and hum or nil
 end
 
--- movement: walk speed + auto sprint + jump power, keep-alive style because
--- games often re-apply their own values on possession/respawn
+-- movement: walk speed + auto sprint + jump power. The WalkSpeed property
+-- lock writes our value back the instant anything tries to reset it, so the
+-- game's per-frame clamps lose the race.
+local function desiredSpeed()
+	local target = tonumber(State["player.speed"]) or 16
+	if State["player.sprint"] == true then
+		target = tonumber(State["player.sprintSpeed"]) or target
+	end
+	return target
+end
+
+local lockedHum, lockConn, lastForced = nil, nil, nil
+local function ensureSpeedLock(hum)
+	if hum == lockedHum then return end
+	if lockConn then pcall(function() lockConn:Disconnect() end) lockConn = nil end
+	lockedHum = hum
+	if not hum then return end
+	pcall(function()
+		lockConn = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+			local target = desiredSpeed()
+			if target ~= 16 and hum.WalkSpeed ~= target then
+				hum.WalkSpeed = target -- game tried to reset us; write back
+			end
+		end)
+	end)
+end
+
 task.spawn(function()
 	while task.wait(0.25) do
 		local hum = getHumanoid()
+		ensureSpeedLock(hum)
 		if hum then
-			local target = tonumber(State["player.speed"]) or 16
-			if State["player.sprint"] == true then
-				target = tonumber(State["player.sprintSpeed"]) or target
-			end
+			local target = desiredSpeed()
 			if target ~= 16 then
 				pcall(function() hum.WalkSpeed = target end)
+				lastForced = target
+			elseif lastForced and hum.WalkSpeed == lastForced then
+				pcall(function() hum.WalkSpeed = 16 end) -- feature off: restore
+				lastForced = nil
 			end
 			local jump = tonumber(State["player.jump"])
 			if jump and jump ~= 50 then
@@ -1458,8 +1490,15 @@ trackConn(UIS.InputEnded:Connect(function(input)
 	end
 end))
 
-local VIM = game:GetService("VirtualInputManager")
-local vimOk = VIM ~= nil and VIM.SendKeyEvent ~= nil
+-- input simulation: the modern public API first, the classic VIM as fallback.
+-- Correct signature is (isPressed, keyCode, ...) - BOOL FIRST, no
+-- UserInputType (the old order silently failed on every release).
+local viOk, viService = pcall(function() return game:GetService("VirtualInput") end)
+if not viOk then viService = nil end
+local vimOk, vimService = pcall(function()
+	return game:GetService("VirtualInputManager")
+end)
+if not vimOk then vimService = nil end
 
 local function releaseShoot()
 	local mode = State["shoot.device"] or "Auto"
@@ -1467,17 +1506,30 @@ local function releaseShoot()
 	if mode == "Keyboard (E)" then k = SHOOT_INPUTS.keyboard
 	elseif mode == "Controller (Square)" then k = SHOOT_INPUTS.gamepad
 	else k = heldShoot or SHOOT_INPUTS.gamepad end
-	local ok = pcall(function()
-		VIM:SendKeyEvent(k.inputType, k.code, false, game)
-	end)
-	return ok, k
+	local errs = {}
+	if viService and viService.SendKey then -- public API (current Roblox)
+		local ok, err = pcall(function()
+			viService:SendKey(false, k.code, false)
+		end)
+		if ok then return true, k end
+		errs[#errs + 1] = tostring(err)
+	end
+	if vimService and vimService.SendKeyEvent then -- executor-unsecured
+		local ok, err = pcall(function()
+			vimService:SendKeyEvent(false, k.code, false, game)
+		end)
+		if ok then return true, k end
+		errs[#errs + 1] = tostring(err)
+	end
+	return false, k, table.concat(errs, " | ")
 end
 
 local METER_HINTS = {
 	"meter", "shotbar", "shot_bar", "shootbar", "shoot_bar", "shotmeter",
 	"shot_meter", "timingbar", "timing", "releasebar", "release_bar",
 	"greenbar", "green_bar", "powerbar", "power_bar", "aimbar", "aim_bar",
-	"shotui", "shot_ui", "shooting", "swing", "hotzone",
+	"shotui", "shot_ui", "shooting", "swing", "hotzone", "gauge",
+	"needle", "fill", "window", "prompt", "perfect",
 }
 local function nameLooksLikeMeter(name)
 	local n = string.lower(tostring(name))
@@ -1493,84 +1545,121 @@ pcall(function()
 		or LocalPlayer:WaitForChild("PlayerGui", 5)
 end)
 
-local function collectMeters()
-	local out = {}
-	if not playerGui then return out end
+-- event-driven index: ONE scan at startup, then DescendantAdded keeps it
+-- fresh. Per-tick cost is a handful of table lookups instead of rescaning
+-- the whole GUI 30x per second (that was dropping FPS hard on big HUDs).
+local meterIndex = {} -- set of GuiObjects whose name looks like a meter
+
+local function consider(d)
 	pcall(function()
-		if not playerGui.Parent then -- PlayerGui can be rebuilt; reacquire
-			playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		if d:IsA("GuiObject") and nameLooksLikeMeter(d.Name) then
+			meterIndex[d] = true
 		end
 	end)
-	pcall(function()
-		for _, d in ipairs(playerGui:GetDescendants()) do
-			local visible = false
-			pcall(function() visible = d:IsA("GuiObject") and d.Visible end)
-			if visible and nameLooksLikeMeter(d.Name) then
-				out[#out + 1] = d
-			end
-		end
-	end)
-	-- meters are compact; a big panel named e.g. "Shooting" is likely the HUD
-	table.sort(out, function(a, b)
-		local function area(o)
-			local ok, sz = pcall(function() return o.AbsoluteSize end)
-			if ok and sz then return sz.X * sz.Y end
-			return math.huge
-		end
-		return area(a) < area(b)
-	end)
-	return out
 end
 
-local meterScan = nil
-local warnedNoMeter = false
+if playerGui then
+	pcall(function()
+		for _, d in ipairs(playerGui:GetDescendants()) do consider(d) end
+		trackConn(playerGui.DescendantAdded:Connect(consider))
+		trackConn(playerGui.DescendantRemoving:Connect(function(d)
+			meterIndex[d] = nil
+		end))
+	end)
+end
+
+local function onScreen(d)
+	local n, steps = d, 0
+	while n and steps < 12 do
+		if n == playerGui then return true end
+		local shown = true
+		pcall(function()
+			if n:IsA("GuiObject") or n:IsA("ScreenGui") then
+				shown = n.Visible ~= false
+			end
+		end)
+		if not shown then return false end
+		n = n.Parent
+		steps = steps + 1
+	end
+	return false
+end
+
+local function snapshot(obj)
+	local sx, sy, px, py = 0, 0, 0, 0
+	pcall(function()
+		local sz, ps = obj.AbsoluteSize, obj.AbsolutePosition
+		sx, sy = sz.X, sz.Y
+		px, py = ps.X, ps.Y
+	end)
+	return { sx = sx, sy = sy, px = px, py = py }
+end
+
+local meterScan, meterAnnounced, warnedNoMeter = nil, false, false
 
 task.spawn(function()
 	while task.wait(1 / 30) do
 		if State["shoot.perfect"] ~= true or not playerGui then
 			meterScan = nil
 		else
-			local candidates = collectMeters()
-			if #candidates == 0 then
+			-- pick the smallest on-screen meter candidate (index is tiny)
+			local cont, bestArea = nil, math.huge
+			for d in pairs(meterIndex) do
+				if onScreen(d) then
+					local ok, sz = pcall(function() return d.AbsoluteSize end)
+					local area = ok and sz and (sz.X * sz.Y) or math.huge
+					if area < bestArea then cont, bestArea = d, area end
+				end
+			end
+			if not cont then
 				meterScan = nil
 				if heldShoot and not warnedNoMeter
 					and os.clock() - heldSince > 1.5 then
 					warnedNoMeter = true
-					Hub:Notify("Shot meter not found - enable the Meter "
-						.. "in the game's settings for Auto Green")
+					Hub:Notify("Shot meter not found - enable the Meter in the "
+						.. "game's settings, then press REPORT (Debug) on SHOOTING")
 				end
 			else
-				local cont = candidates[1]
 				if not meterScan or meterScan.container ~= cont then
-					-- new shot: snapshot every part of the meter
+					if not meterAnnounced then
+						meterAnnounced = true
+						warnedNoMeter = false
+						pcall(function()
+							print("[Azure] shot meter: " .. cont:GetFullName())
+						end)
+						Hub:Notify("Auto Green: meter found (" .. cont.Name .. ")")
+					end
+					-- new shot: snapshot the meter itself + all its parts,
+					-- tracking size AND position (some meters slide a needle)
 					meterScan = {
 						container = cont, base = {}, maxDelta = {},
 						released = false, startedAt = os.clock(),
 					}
+					meterScan.base[cont] = snapshot(cont)
 					pcall(function()
 						for _, d in ipairs(cont:GetDescendants()) do
 							if d:IsA("GuiObject") then
-								meterScan.base[d] = d.AbsoluteSize
+								meterScan.base[d] = snapshot(d)
 							end
 						end
 					end)
 				else
-					-- measure how much the bar has grown since the snapshot
 					local progress = 0
 					pcall(function()
 						for obj, base in pairs(meterScan.base) do
-							local sz = obj.AbsoluteSize
-							local dx = math.abs(sz.X - base.X)
-							local dy = math.abs(sz.Y - base.Y)
-							local delta = math.max(dx, dy)
+							local cur = snapshot(obj)
+							local delta = math.max(
+								math.abs(cur.sx - base.sx),
+								math.abs(cur.sy - base.sy),
+								math.abs(cur.px - base.px),
+								math.abs(cur.py - base.py))
 							local prevMax = meterScan.maxDelta[obj] or 0
 							if delta > prevMax then
 								meterScan.maxDelta[obj] = delta
 							end
 							local denom = meterScan.maxDelta[obj]
-							if denom > 8 then -- real bar, not layout noise
-								local ratio = math.clamp(
-									delta / denom, 0, 1)
+							if denom > 8 then -- real bar motion, not layout noise
+								local ratio = math.clamp(delta / denom, 0, 1)
 								if ratio > progress then progress = ratio end
 							end
 						end
@@ -1582,12 +1671,12 @@ task.spawn(function()
 						meterScan.released = true
 						local delay = (tonumber(State["shoot.delay"]) or 0) / 1000
 						task.delay(delay, function()
-							local ok, k = releaseShoot()
+							local ok, k, err = releaseShoot()
 							if ok then
 								Hub:Notify("Auto Green released (" .. k.label .. ")")
 							else
-								Hub:Notify("Auto Green could not release input"
-									.. " - check VirtualInputManager support")
+								Hub:Notify("Release failed: "
+									.. tostring(err):sub(1, 60))
 							end
 						end)
 					end
@@ -1597,10 +1686,36 @@ task.spawn(function()
 	end
 end)
 
-if not vimOk then
+if not viService and not vimService then
 	task.spawn(function()
-		Hub:Notify("Input simulation unavailable - Auto Green release is disabled")
+		Hub:Notify("No input simulation in this executor - Auto Green disabled")
 	end)
+end
+
+Diagnose = function()
+	local parts = {}
+	parts[#parts + 1] = "VirtualInput="
+		.. ((viService and viService.SendKey) and "OK" or "NO")
+	parts[#parts + 1] = "VIM="
+		.. ((vimService and vimService.SendKeyEvent) and "OK" or "NO")
+	local names = {}
+	for d in pairs(meterIndex) do
+		pcall(function() names[#names + 1] = d:GetFullName() end)
+	end
+	parts[#parts + 1] = "meters=" .. #names
+	parts[#parts + 1] = "holding=" .. (heldShoot and heldShoot.label or "none")
+	local hum = getHumanoid()
+	parts[#parts + 1] = hum and ("ws=" .. tostring(hum.WalkSpeed))
+		or "noHumanoid"
+	local line = table.concat(parts, "  ")
+	print("[Azure] diagnostics: " .. line)
+	if #names > 0 then
+		print("[Azure] meter candidates: " .. table.concat(names, ", "))
+		Hub:Notify("Meters: " .. table.concat(names, ", "):sub(1, 90))
+	else
+		Hub:Notify("No meter GUI found - enable the game's Meter setting, "
+			.. "hold your shoot button, then press REPORT again")
+	end
 end
 
 -- ------------------------------------------------------------- Startup ---
