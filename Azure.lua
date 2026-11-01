@@ -137,7 +137,7 @@ local function readConfigFile()
 	return nil
 end
 
-local Hub = { Version = "1.0.0" }
+local Hub = { Version = "1.1.0" }
 Hub.Changed = Signal.new()
 
 function Hub:Get(id) return State[id] end
@@ -257,6 +257,10 @@ local function beginCapture(onKey)
 			capturing = nil
 			if input.KeyCode == Enum.KeyCode.Escape then onKey(nil)
 			else onKey(input.KeyCode.Name) end
+		elseif input.UserInputType == Enum.UserInputType.Gamepad1 then
+			if input.KeyCode == Enum.KeyCode.Unknown then return end
+			capturing = nil
+			onKey(input.KeyCode.Name) -- e.g. ButtonX, ButtonL3, DPadUp
 		elseif input.UserInputType == Enum.UserInputType.MouseButton1
 			or input.UserInputType == Enum.UserInputType.MouseButton2
 			or input.UserInputType == Enum.UserInputType.MouseButton3 then
@@ -828,6 +832,7 @@ function Section:Dropdown(label, id, options, default, multi)
 					BackgroundTransparency = 1,
 					BorderSizePixel = 0,
 					AutoButtonColor = false,
+					Selectable = true,
 					Text = "",
 					LayoutOrder = i,
 					Parent = popup,
@@ -1091,14 +1096,16 @@ do
 	local p = Hub:Page("SHOOTING", true)
 	local l = p:Section("AUTO SHOOTING", 1)
 	l:Toggle("Auto Shoot", "shoot.auto", false)
-	l:Keybind("Shoot Key (Hold)", "shoot.key", "F")
-	l:Toggle("Perfect Release", "shoot.perfect", true)
+	l:Keybind("Shoot Key (Hold)", "shoot.key", "E")
+	l:Toggle("Perfect Release / Auto Green", "shoot.perfect", true)
 	l:Slider("Shot Range (studs)", "shoot.range", 10, 100, 60)
 	l = p:Section("RELEASE", 2)
-	l:Slider("Release Window (ms)", "shoot.window", 10, 200, 40)
+	l:Slider("Green Release %", "shoot.greenAt", 50, 100, 90)
 	l:Slider("Release Delay (ms)", "shoot.delay", 0, 300, 0)
-	l:Toggle("Only When Open", "shoot.openOnly", false)
-	l:Dropdown("Shot Mode", "shoot.mode", { "Hold", "Toggle", "Tap" }, "Hold")
+	l:Dropdown("Release Input", "shoot.device",
+		{ "Auto", "Keyboard (E)", "Controller (Square)" }, "Auto")
+	l:Info("Auto Green watches the shot meter and releases inside the green zone. It works on keyboard and on a PS5/Xbox controller. If it never fires, enable the Meter in the game's settings.")
+	l:Info("Auto Shoot needs game internals - not active yet.")
 end
 
 -- PLAYER
@@ -1106,14 +1113,15 @@ do
 	local p = Hub:Page("PLAYER", true)
 	local l = p:Section("CHARACTER", 1)
 	l:Slider("Walk Speed", "player.speed", 16, 100, 16)
+	l:Toggle("Auto Sprint", "player.sprint", false)
+	l:Slider("Sprint Speed", "player.sprintSpeed", 16, 120, 40)
 	l:Slider("Jump Power", "player.jump", 50, 150, 50)
 	l:Toggle("Infinite Stamina", "player.stamina", false)
 	l:Toggle("No Fall Damage", "player.noFall", false)
+	l:Info("Speed, Auto Sprint and Jump Power work on keyboard AND controller - they drive the Humanoid directly.")
 	l = p:Section("CAMERA", 2)
 	l:Slider("Field of View", "player.fov", 60, 120, 70)
 	l:Toggle("Fullbright", "player.fullbright", false)
-	l:Toggle("Auto Sprint", "player.sprint", false)
-	l:Slider("Sprint Speed", "player.sprintSpeed", 16, 120, 40)
 end
 
 -- DRIBBLING
@@ -1285,6 +1293,8 @@ trackConn(UIS.InputBegan:Connect(function(input)
 	local matched = (input.UserInputType == Enum.UserInputType.Keyboard
 			and input.KeyCode.Name == key)
 		or (input.UserInputType.Name == key)
+		or (input.UserInputType == Enum.UserInputType.Gamepad1
+			and input.KeyCode == Enum.KeyCode.ButtonSelect) -- controller menu toggle
 	if matched then
 		closePopups()
 		window.Visible = not window.Visible
@@ -1293,6 +1303,14 @@ trackConn(UIS.InputBegan:Connect(function(input)
 			TweenService:Create(uiScale, TweenInfo.new(0.18, Enum.EasingStyle.Quad),
 				{ Scale = 1 }):Play()
 		end
+		-- controller focus: jump the selection cursor onto the sidebar
+		pcall(function()
+			if window.Visible and input.UserInputType == Enum.UserInputType.Gamepad1 then
+				GuiService.SelectedObject = TabButtons["Azure"]
+			elseif not window.Visible then
+				GuiService.SelectedObject = nil
+			end
+		end)
 	end
 end))
 
@@ -1357,6 +1375,10 @@ Hub.Changed:Connect(function(id, value)
 		pcall(function()
 			if typeof(setfpscap) == "function" then setfpscap(value and 144 or 60) end
 		end)
+	elseif id == "player.sprint" then
+		Hub:Notify(value == true
+			and ("Auto Sprint ON - speed " .. tostring(State["player.sprintSpeed"]))
+			or "Auto Sprint OFF")
 	end
 	if State["ui.autoSave"] == false then return end
 	saveToken = saveToken + 1
@@ -1365,6 +1387,221 @@ Hub.Changed:Connect(function(id, value)
 		if mine == saveToken then saveConfigFile() end
 	end)
 end)
+
+-- ------------------------------------------------------- Gameplay engine ---
+-- Real behavior for Practical Basketball. Everything here is input-agnostic:
+-- it drives the Humanoid and reads the shot GUI, so it works the same on
+-- keyboard/mouse and on a PS5/Xbox controller.
+
+local function getHumanoid()
+	local ok, hum = pcall(function()
+		local char = LocalPlayer.Character
+		return char and char:FindFirstChildOfClass("Humanoid")
+	end)
+	return ok and hum or nil
+end
+
+-- movement: walk speed + auto sprint + jump power, keep-alive style because
+-- games often re-apply their own values on possession/respawn
+task.spawn(function()
+	while task.wait(0.25) do
+		local hum = getHumanoid()
+		if hum then
+			local target = tonumber(State["player.speed"]) or 16
+			if State["player.sprint"] == true then
+				target = tonumber(State["player.sprintSpeed"]) or target
+			end
+			if target ~= 16 then
+				pcall(function() hum.WalkSpeed = target end)
+			end
+			local jump = tonumber(State["player.jump"])
+			if jump and jump ~= 50 then
+				pcall(function()
+					hum.UseJumpPower = true
+					hum.JumpPower = jump
+				end)
+			end
+		end
+	end
+end)
+
+-- ----------------------------------------------------------- Auto green ---
+-- The game meters every shot: hold the shoot button (E / Square / X), a meter
+-- fills, release inside the green zone. Perfect Release tracks the meter GUI
+-- and simulates the release at the configured fill percentage.
+
+local SHOOT_INPUTS = {
+	keyboard = {
+		inputType = Enum.UserInputType.Keyboard,
+		code = Enum.KeyCode.E, label = "E",
+	},
+	gamepad = {
+		inputType = Enum.UserInputType.Gamepad1,
+		code = Enum.KeyCode.ButtonX, label = "Square",
+	},
+}
+
+local heldShoot, heldSince = nil, 0 -- what the player is physically holding
+trackConn(UIS.InputBegan:Connect(function(input)
+	for _, k in pairs(SHOOT_INPUTS) do
+		if input.UserInputType == k.inputType and input.KeyCode == k.code then
+			heldShoot, heldSince = k, os.clock()
+		end
+	end
+end))
+trackConn(UIS.InputEnded:Connect(function(input)
+	for _, k in pairs(SHOOT_INPUTS) do
+		if input.UserInputType == k.inputType and input.KeyCode == k.code
+			and heldShoot == k then
+			heldShoot = nil
+		end
+	end
+end))
+
+local VIM = game:GetService("VirtualInputManager")
+local vimOk = VIM ~= nil and VIM.SendKeyEvent ~= nil
+
+local function releaseShoot()
+	local mode = State["shoot.device"] or "Auto"
+	local k
+	if mode == "Keyboard (E)" then k = SHOOT_INPUTS.keyboard
+	elseif mode == "Controller (Square)" then k = SHOOT_INPUTS.gamepad
+	else k = heldShoot or SHOOT_INPUTS.gamepad end
+	local ok = pcall(function()
+		VIM:SendKeyEvent(k.inputType, k.code, false, game)
+	end)
+	return ok, k
+end
+
+local METER_HINTS = {
+	"meter", "shotbar", "shot_bar", "shootbar", "shoot_bar", "shotmeter",
+	"shot_meter", "timingbar", "timing", "releasebar", "release_bar",
+	"greenbar", "green_bar", "powerbar", "power_bar", "aimbar", "aim_bar",
+	"shotui", "shot_ui", "shooting", "swing", "hotzone",
+}
+local function nameLooksLikeMeter(name)
+	local n = string.lower(tostring(name))
+	for _, hint in ipairs(METER_HINTS) do
+		if string.find(n, hint, 1, true) then return true end
+	end
+	return false
+end
+
+local playerGui = nil
+pcall(function()
+	playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		or LocalPlayer:WaitForChild("PlayerGui", 5)
+end)
+
+local function collectMeters()
+	local out = {}
+	if not playerGui then return out end
+	pcall(function()
+		if not playerGui.Parent then -- PlayerGui can be rebuilt; reacquire
+			playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		end
+	end)
+	pcall(function()
+		for _, d in ipairs(playerGui:GetDescendants()) do
+			local visible = false
+			pcall(function() visible = d:IsA("GuiObject") and d.Visible end)
+			if visible and nameLooksLikeMeter(d.Name) then
+				out[#out + 1] = d
+			end
+		end
+	end)
+	-- meters are compact; a big panel named e.g. "Shooting" is likely the HUD
+	table.sort(out, function(a, b)
+		local function area(o)
+			local ok, sz = pcall(function() return o.AbsoluteSize end)
+			if ok and sz then return sz.X * sz.Y end
+			return math.huge
+		end
+		return area(a) < area(b)
+	end)
+	return out
+end
+
+local meterScan = nil
+local warnedNoMeter = false
+
+task.spawn(function()
+	while task.wait(1 / 30) do
+		if State["shoot.perfect"] ~= true or not playerGui then
+			meterScan = nil
+		else
+			local candidates = collectMeters()
+			if #candidates == 0 then
+				meterScan = nil
+				if heldShoot and not warnedNoMeter
+					and os.clock() - heldSince > 1.5 then
+					warnedNoMeter = true
+					Hub:Notify("Shot meter not found - enable the Meter "
+						.. "in the game's settings for Auto Green")
+				end
+			else
+				local cont = candidates[1]
+				if not meterScan or meterScan.container ~= cont then
+					-- new shot: snapshot every part of the meter
+					meterScan = {
+						container = cont, base = {}, maxDelta = {},
+						released = false, startedAt = os.clock(),
+					}
+					pcall(function()
+						for _, d in ipairs(cont:GetDescendants()) do
+							if d:IsA("GuiObject") then
+								meterScan.base[d] = d.AbsoluteSize
+							end
+						end
+					end)
+				else
+					-- measure how much the bar has grown since the snapshot
+					local progress = 0
+					pcall(function()
+						for obj, base in pairs(meterScan.base) do
+							local sz = obj.AbsoluteSize
+							local dx = math.abs(sz.X - base.X)
+							local dy = math.abs(sz.Y - base.Y)
+							local delta = math.max(dx, dy)
+							local prevMax = meterScan.maxDelta[obj] or 0
+							if delta > prevMax then
+								meterScan.maxDelta[obj] = delta
+							end
+							local denom = meterScan.maxDelta[obj]
+							if denom > 8 then -- real bar, not layout noise
+								local ratio = math.clamp(
+									delta / denom, 0, 1)
+								if ratio > progress then progress = ratio end
+							end
+						end
+					end)
+					if progress < 0.15 then meterScan.released = false end
+					local greenAt = (tonumber(State["shoot.greenAt"]) or 90) / 100
+					if not meterScan.released and progress >= greenAt
+						and os.clock() - meterScan.startedAt > 0.15 then
+						meterScan.released = true
+						local delay = (tonumber(State["shoot.delay"]) or 0) / 1000
+						task.delay(delay, function()
+							local ok, k = releaseShoot()
+							if ok then
+								Hub:Notify("Auto Green released (" .. k.label .. ")")
+							else
+								Hub:Notify("Auto Green could not release input"
+									.. " - check VirtualInputManager support")
+							end
+						end)
+					end
+				end
+			end
+		end
+	end
+end)
+
+if not vimOk then
+	task.spawn(function()
+		Hub:Notify("Input simulation unavailable - Auto Green release is disabled")
+	end)
+end
 
 -- ------------------------------------------------------------- Startup ---
 Pristine = DeepCopy(State)
@@ -1379,6 +1616,13 @@ watermark.Visible = State["ui.watermark"] == true
 for _, page in pairs(Pages) do page:_updateCanvas() end
 
 switchPage("Azure")
+
+-- controller support: let the PS5/Xbox thumbstick + D-pad navigate the UI
+pcall(function()
+	for _, d in ipairs(gui:GetDescendants()) do
+		if d:IsA("GuiButton") then d.Selectable = true end
+	end
+end)
 
 if State["ui.animations"] ~= false then
 	uiScale.Scale = 0.94
