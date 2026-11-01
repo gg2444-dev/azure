@@ -137,7 +137,7 @@ local function readConfigFile()
 	return nil
 end
 
-local Hub = { Version = "1.2.0" }
+local Hub = { Version = "1.3.0" }
 Hub.Changed = Signal.new()
 
 function Hub:Get(id) return State[id] end
@@ -801,7 +801,8 @@ function Section:Dropdown(label, id, options, default, multi)
 		closePopups()
 		if not popup then
 			local itemH = 24
-			local h = math.min(#options * itemH + 8, 176)
+			local totalH = #options * (itemH + 2) + 10
+			local h = math.min(totalH, 184)
 			popup = New("ScrollingFrame", {
 				AnchorPoint = Vector2.new(1, 0),
 				Size = UDim2.fromOffset(math.max(box.AbsoluteSize.X + 16, 140), h),
@@ -810,7 +811,7 @@ function Section:Dropdown(label, id, options, default, multi)
 				BorderSizePixel = 0,
 				ScrollBarThickness = 3,
 				ScrollBarImageColor3 = Accent,
-				CanvasSize = UDim2.new(0, 0, 0, #options * itemH + 8),
+				CanvasSize = UDim2.new(0, 0, 0, totalH),
 				AutomaticCanvasSize = Enum.AutomaticSize.None,
 				Visible = false,
 				Parent = gui,
@@ -822,6 +823,11 @@ function Section:Dropdown(label, id, options, default, multi)
 			New("UIPadding", {
 				PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4),
 				PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4),
+				Parent = popup,
+			})
+			New("UIListLayout", { -- without this every option stacks at 0,0
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 2),
 				Parent = popup,
 			})
 			popups[#popups + 1] = popup
@@ -1201,13 +1207,13 @@ do
 		{ "Gold", "Red", "Cyan", "Purple", "Green", "White" }, "Gold")
 	l:Toggle("UI Animations", "ui.animations", true)
 	l = p:Section("CONFIG", 2)
-	l:Button("File", "Save", function()
+	l:Button("Config", "Save", function()
 		Hub:Notify(saveConfigFile() and "Config saved"
 			or (fileAPI() and "Save failed" or "File API unavailable"))
 	end)
-	l:Button("File", "Load", function() Hub:LoadConfig() end)
-	l:Button("File", "Reset", function() Hub:ResetConfig() end)
-	l:Button("UI", "Destroy", function() Hub:Destroy() end)
+	l:Button("Config", "Load", function() Hub:LoadConfig() end)
+	l:Button("Config", "Reset", function() Hub:ResetConfig() end)
+	l:Button("Window", "Destroy", function() Hub:Destroy() end)
 	l:Info("\u{25CB} hide \u{2022} \u{2014} minimize \u{2022} X destroy")
 end
 
@@ -1500,28 +1506,46 @@ local vimOk, vimService = pcall(function()
 end)
 if not vimOk then vimService = nil end
 
+local lastRelease = "never"
+
 local function releaseShoot()
 	local mode = State["shoot.device"] or "Auto"
-	local k
-	if mode == "Keyboard (E)" then k = SHOOT_INPUTS.keyboard
-	elseif mode == "Controller (Square)" then k = SHOOT_INPUTS.gamepad
-	else k = heldShoot or SHOOT_INPUTS.gamepad end
-	local errs = {}
-	if viService and viService.SendKey then -- public API (current Roblox)
-		local ok, err = pcall(function()
-			viService:SendKey(false, k.code, false)
-		end)
-		if ok then return true, k end
-		errs[#errs + 1] = tostring(err)
+	local primary, codes
+	if mode == "Keyboard (E)" then
+		primary, codes = SHOOT_INPUTS.keyboard, { SHOOT_INPUTS.keyboard.code }
+	elseif mode == "Controller (Square)" then
+		primary, codes = SHOOT_INPUTS.gamepad, { SHOOT_INPUTS.gamepad.code }
+	else
+		-- Auto: release whatever is physically held PLUS the other device as
+		-- backup - unmatched release events are harmless, the game ignores them
+		primary = heldShoot or SHOOT_INPUTS.gamepad
+		codes = { SHOOT_INPUTS.gamepad.code, SHOOT_INPUTS.keyboard.code }
 	end
-	if vimService and vimService.SendKeyEvent then -- executor-unsecured
-		local ok, err = pcall(function()
-			vimService:SendKeyEvent(false, k.code, false, game)
-		end)
-		if ok then return true, k end
-		errs[#errs + 1] = tostring(err)
+	local errs, injected = {}, 0
+	for _, code in ipairs(codes) do
+		local did = false
+		if viService and viService.SendKey then -- public API (current Roblox)
+			local ok, err = pcall(function()
+				viService:SendKey(false, code, false)
+			end)
+			if ok then did = true else errs[#errs + 1] = tostring(err) end
+		end
+		if vimService and vimService.SendKeyEvent then -- executor-unsecured
+			local ok, err = pcall(function()
+				vimService:SendKeyEvent(false, code, false, game)
+			end)
+			if ok then did = true else errs[#errs + 1] = tostring(err) end
+		end
+		if did then injected = injected + 1 end
 	end
-	return false, k, table.concat(errs, " | ")
+	if injected > 0 then
+		lastRelease = "OK " .. primary.label .. " (" .. injected .. " injections)"
+		return true, primary
+	end
+	local why = #errs > 0 and table.concat(errs, " | ")
+		or "no input-simulation API"
+	lastRelease = "FAIL " .. why
+	return false, primary, why
 end
 
 local METER_HINTS = {
@@ -1595,6 +1619,50 @@ local function snapshot(obj)
 	return { sx = sx, sy = sy, px = px, py = py }
 end
 
+-- green zone: the shot meter paints its green release window as a green-ish
+-- block inside the bar. Find it and compute where its center sits along the
+-- bar's dominant axis (0..1), so we release exactly when the fill reaches it.
+-- Prefer the smallest green block (the fixed zone window) over a large green
+-- fill, tie-break leftmost.
+local function findGreenZone(cont)
+	local bestFrac, bestArea = nil, math.huge
+	local cs = snapshot(cont)
+	local horizontal = cs.sx >= cs.sy
+	pcall(function()
+		for _, d in ipairs(cont:GetDescendants()) do
+			if d:IsA("GuiObject") and d.Visible ~= false then
+				local col, green = nil, false
+				pcall(function() col = d.BackgroundColor3 end)
+				green = col and col.G > 0.35
+					and col.G > col.R + 0.15 and col.G > col.B + 0.15
+				if not green then
+					pcall(function() col = d.ImageColor3 end)
+					green = col and col.G > 0.35
+						and col.G > col.R + 0.15 and col.G > col.B + 0.15
+				end
+				if green then
+					local s = snapshot(d)
+					local frac
+					if horizontal and cs.sx > 0 then
+						frac = ((s.px + s.sx / 2) - cs.px) / cs.sx
+					elseif cs.sy > 0 then
+						frac = ((s.py + s.sy / 2) - cs.py) / cs.sy
+					end
+					if frac and frac >= -0.1 and frac <= 1.1 then
+						frac = math.clamp(frac, 0, 1)
+						local area = s.sx * s.sy
+						if area < bestArea
+							or (area == bestArea and frac < (bestFrac or 1)) then
+							bestFrac, bestArea = frac, area
+						end
+					end
+				end
+			end
+		end
+	end)
+	return bestFrac
+end
+
 local meterScan, meterAnnounced, warnedNoMeter = nil, false, false
 
 task.spawn(function()
@@ -1620,6 +1688,7 @@ task.spawn(function()
 						.. "game's settings, then press REPORT (Debug) on SHOOTING")
 				end
 			else
+				warnedNoMeter = false -- meter present again; allow future warnings
 				if not meterScan or meterScan.container ~= cont then
 					if not meterAnnounced then
 						meterAnnounced = true
@@ -1644,6 +1713,10 @@ task.spawn(function()
 						end
 					end)
 				else
+					-- keep looking for the green window until we find it
+					if meterScan.zone == nil then
+						meterScan.zone = findGreenZone(cont)
+					end
 					local progress = 0
 					pcall(function()
 						for obj, base in pairs(meterScan.base) do
@@ -1664,11 +1737,22 @@ task.spawn(function()
 							end
 						end
 					end)
+					meterScan.lastProgress = progress
 					if progress < 0.15 then meterScan.released = false end
 					local greenAt = (tonumber(State["shoot.greenAt"]) or 90) / 100
-					if not meterScan.released and progress >= greenAt
+					-- release at the detected green zone, else at the slider %
+					local target = meterScan.zone or greenAt
+					if not meterScan.released and progress >= target
 						and os.clock() - meterScan.startedAt > 0.15 then
 						meterScan.released = true
+						local function pct(v)
+							return math.floor(v * 100 + 0.5)
+						end
+						print(string.format(
+							"[Azure] release: progress=%d%% target=%d%% zone=%s",
+							pct(progress), pct(target),
+							meterScan.zone and (pct(meterScan.zone) .. "%")
+								or "none"))
 						local delay = (tonumber(State["shoot.delay"]) or 0) / 1000
 						task.delay(delay, function()
 							local ok, k, err = releaseShoot()
@@ -1704,6 +1788,16 @@ Diagnose = function()
 	end
 	parts[#parts + 1] = "meters=" .. #names
 	parts[#parts + 1] = "holding=" .. (heldShoot and heldShoot.label or "none")
+	parts[#parts + 1] = "scan=" .. (meterScan and "active" or "idle")
+	if meterScan then
+		local function pct(v) return math.floor(v * 100 + 0.5) end
+		parts[#parts + 1] = "progress="
+			.. (meterScan.lastProgress
+				and (pct(meterScan.lastProgress) .. "%") or "-")
+		parts[#parts + 1] = "zone="
+			.. (meterScan.zone and (pct(meterScan.zone) .. "%") or "-")
+	end
+	parts[#parts + 1] = "release=" .. lastRelease
 	local hum = getHumanoid()
 	parts[#parts + 1] = hum and ("ws=" .. tostring(hum.WalkSpeed))
 		or "noHumanoid"
