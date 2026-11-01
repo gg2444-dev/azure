@@ -297,6 +297,16 @@ end))
 local WINDOW_W, WINDOW_H, TITLE_H, SIDEBAR_W = 780, 500, 46, 152
 local ROW_GAP, SECTION_GAP = 6, 12
 
+pcall(function() -- remove any previous Azure UI (re-execute safety)
+	local existing = game:GetService("CoreGui"):FindFirstChild("Azure")
+	if existing then existing:Destroy() end
+end)
+pcall(function()
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	local existing = pg and pg:FindFirstChild("Azure")
+	if existing then existing:Destroy() end
+end)
+
 gui = New("ScreenGui", {
 	Name = "Azure",
 	ResetOnSpawn = false,
@@ -1383,6 +1393,36 @@ end)
 
 print("[Azure] v" .. Hub.Version .. " loaded - "
 	.. tostring(State["ui.menuKey"]) .. " toggles the UI")
+
+do -- visible load banner: green = built, red = exact error
+	local n = 0
+	for _ in pairs(Pages) do n = n + 1 end
+	local okBuild = (buildOk ~= false) and n == 8
+	local banner = New("TextLabel", {
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 8),
+		Size = UDim2.new(0, 720, 0, 34),
+		BackgroundColor3 = okBuild and Color3.fromRGB(30, 130, 70)
+			or Color3.fromRGB(175, 40, 40),
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		TextSize = okBuild and 13 or 11,
+		TextColor3 = Color3.fromRGB(255, 255, 255),
+		Text = okBuild
+			and ("[Azure] OK - " .. n .. "/8 pages built - "
+				.. tostring(State["ui.menuKey"]) .. " toggles the menu")
+			or ("[Azure] BUILD ERROR: " .. tostring(buildErr)),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = gui,
+		ZIndex = 400,
+	})
+	AddCorner(banner, 6)
+	if okBuild then
+		task.delay(7, function()
+			pcall(function() banner:Destroy() end)
+		end)
+	end
+end
 
 task.spawn(function()
 	task.wait(0.5)
