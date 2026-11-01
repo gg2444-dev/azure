@@ -1014,6 +1014,7 @@ local function buildSidebar()
 end
 
 -- --------------------------------------------------------- Page content ---
+local buildOk, buildErr = pcall(function()
 buildSidebar()
 
 local function envName()
@@ -1201,6 +1202,14 @@ do
 	l:Toggle("Auto Offset to Rim", "offsets.autoRim", false)
 	l:Info("Offsets are applied to block/rebound/glide target positions.")
 end
+end)
+
+if not buildOk then
+	local msg = "content build error: " .. tostring(buildErr)
+	print("[Azure] " .. msg)
+	warn("[Azure] " .. msg)
+	task.spawn(function() Hub:Notify(msg) end)
+end
 
 -- ------------------------------------------------- Window behaviour ---
 local minimized = false
@@ -1356,6 +1365,8 @@ if loaded then pushAll(loaded) end
 applyAccent(AccentNames[State["ui.accent"]] or AccentNames.Gold)
 uiScale.Scale = math.clamp(tonumber(State["ui.scale"]) or 1, 0.8, 1.2)
 watermark.Visible = State["ui.watermark"] == true
+
+for _, page in pairs(Pages) do page:_updateCanvas() end
 
 switchPage("Azure")
 
